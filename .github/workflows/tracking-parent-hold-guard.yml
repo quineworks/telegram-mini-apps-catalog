@@ -1,0 +1,211 @@
+# platform#3253: a self-healing backstop for the `tracking-parent-hold`
+# bypass pattern — an agent closes a held tracking parent directly instead
+# of letting `tracking-parent-auto-closer.yml` do it, sometimes stripping
+# the hold label in the same action. This has recurred three times (#1121,
+# tax-lane#820/#838, tax-lane#2547) despite a prompt guardrail in
+# `manager.md`/`reviewer.md` (#1804) — prose doesn't reliably survive a
+# long/multi-step agent run, so this doesn't depend on the dispatched agent
+# remembering/following it.
+#
+# Additive only: this never touches `tracking-parent-auto-closer.yml` or its
+# script, it only guards against bypassing it. `decideBypass()`
+# (`scripts/tracking-parent-hold-guard.cjs`) needs no Sub-issues API call —
+# `tracking-parent-hold` is, by convention, applied exclusively to tracking
+# parents, so the closed issue's own label history (via the Issue Events
+# API) is sufficient to tell a bypass from a legitimate close.
+#
+# Same shape as `tracking-parent-auto-closer.yml`: `issues: closed` trigger,
+# no python3 on the self-hosted runner
+# (`infra/ci_runner_bootstrap.sh.tftpl`), heredoc'd Node requiring the
+# fixture-tested pure function rather than reimplementing it inline.
+#
+# `tracking-parent-auto-closer.yml`'s own closes always run under
+# `github.token`, so they show up as actor `github-actions[bot]` —
+# `decideBypass()` treats that actor as always legitimate and short-circuits
+# before looking at label history, so this guard can never fight the
+# auto-closer it's meant to protect.
+#
+# platform#4252: previously this reopened + restored the hold on every
+# detected bypass unconditionally, with no check on whether the DoD was
+# actually met — so genuinely-done work that was closed directly instead of
+# through `tracking-parent-auto-closer.yml` got reopened anyway, forcing an
+# agent to repeat the exact "remove hold, let the auto-closer close it"
+# remediation this guard's own comment prescribes. `decideRemediation()`
+# (`scripts/tracking-parent-hold-guard.cjs`) is the backstop layered on top
+# of `decideBypass()`: on a detected bypass it now also runs
+# `decideClose()`'s own sub-issues/GraphQL-total verification against the
+# closed issue's own sub-issues (by convention the hold only ever sits on a
+# tracking parent) before deciding whether to self-heal (remove the hold,
+# leave it closed) or revert (reopen + restore the hold, as before).
+#
+# platform#4294/#4301: `fetchAllSubIssues()`/`fetchExpectedTotal()` below
+# used to run under the plain per-run `github.token`, scoped to only this
+# repo — for a parent with a cross-repo child (e.g. blinkblocks#142 linked
+# to platform#4273) GitHub silently omits the unreadable child from BOTH
+# the REST list and the GraphQL total, so they agreed with each other
+# while both undercounting, and `decideClose()`'s fail-safe never caught
+# it — this guard kept reverting #142's genuinely-complete close as a
+# false bypass. Same fix as `tracking-parent-auto-closer.yml`'s own header
+# comment: assume the generic `quineworks-github-actions` role (trusted
+# for `repo:quineworks/*:*`, since this workflow propagates to every
+# product repo) and fetch the org-wide `github_token` PAT from the secrets
+# broker, which has real read access across every quineworks/* repo.
+name: tracking-parent-hold-guard
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+concurrency:
+  group: tracking-parent-hold-guard-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        # Reads the `github_token` field from the field-scoped secrets
+        # broker (platform#2276) — see this workflow's header comment
+        # (platform#4294/#4301) for why the plain `github.token` can't see
+        # cross-repo sub-issues.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
+      - name: Detect and self-heal a tracking-parent-hold bypass
+        env:
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CLOSED_AT: ${{ github.event.issue.closed_at }}
+          CLOSED_BY: ${{ github.event.sender.login }}
+        run: |
+          cat > /tmp/tracking-parent-hold-guard.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+          const { decideBypass, decideRemediation } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-hold-guard.cjs');
+
+          const REPO = process.env.REPO;
+          const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
+          const CLOSED_AT = process.env.CLOSED_AT;
+          const CLOSED_BY = process.env.CLOSED_BY;
+
+          function fetchAllEvents(ownerRepo, number) {
+            const events = [];
+            let page = 1;
+            for (;;) {
+              const out = execFileSync('gh', [
+                'api',
+                `repos/${ownerRepo}/issues/${number}/events`,
+                '-X', 'GET',
+                '-f', 'per_page=100',
+                '-f', `page=${page}`,
+              ], { encoding: 'utf8' });
+              const batch = JSON.parse(out);
+              events.push(...batch);
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return events;
+          }
+
+          function fetchAllSubIssues(ownerRepo, number) {
+            const issues = [];
+            let page = 1;
+            for (;;) {
+              const out = execFileSync('gh', [
+                'api',
+                `repos/${ownerRepo}/issues/${number}/sub_issues`,
+                '-X', 'GET',
+                '-f', 'per_page=100',
+                '-f', `page=${page}`,
+              ], { encoding: 'utf8' });
+              const batch = JSON.parse(out);
+              issues.push(...batch);
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return issues;
+          }
+
+          function fetchExpectedTotal(ownerRepo, number) {
+            const [owner, repo] = ownerRepo.split('/');
+            const query = 'query($owner:String!,$repo:String!,$number:Int!){ ' +
+              'repository(owner:$owner,name:$repo){ issue(number:$number){ ' +
+              'subIssuesSummary { total } } } }';
+            const out = execFileSync('gh', [
+              'api', 'graphql',
+              '-f', `query=${query}`,
+              '-f', `owner=${owner}`,
+              '-f', `repo=${repo}`,
+              '-F', `number=${number}`,
+            ], { encoding: 'utf8' });
+            return JSON.parse(out).data.repository.issue.subIssuesSummary.total;
+          }
+
+          const events = fetchAllEvents(REPO, ISSUE_NUMBER);
+          const { isBypass, reason: bypassReason } = decideBypass({ events, closedAt: CLOSED_AT, closedByLogin: CLOSED_BY });
+          console.log(`decideBypass(${REPO}#${ISSUE_NUMBER}): isBypass=${isBypass} — ${bypassReason}`);
+
+          if (!isBypass) process.exit(0);
+
+          // Fail safe: if either fetch can't be trusted, decideRemediation()
+          // below still gets a well-formed (if empty/unverifiable) input and
+          // falls through to 'revert' — never silently skips the guard.
+          let subIssues = [];
+          let expectedTotal;
+          try {
+            subIssues = fetchAllSubIssues(REPO, ISSUE_NUMBER);
+            expectedTotal = fetchExpectedTotal(REPO, ISSUE_NUMBER);
+          } catch (e) {
+            console.log(`::warning::Could not verify ${REPO}#${ISSUE_NUMBER}'s sub-issues/total — treating DoD as unverified.`);
+          }
+
+          const { action, reason } = decideRemediation({ isBypass, subIssues, expectedTotal });
+          console.log(`decideRemediation(${REPO}#${ISSUE_NUMBER}): action=${action} — ${reason}`);
+
+          if (action === 'self-heal') {
+            execFileSync('gh', ['issue', 'edit', ISSUE_NUMBER, '--repo', REPO, '--remove-label', 'tracking-parent-hold'], { stdio: 'inherit' });
+
+            const selfHealComment = '🔓 **tracking-parent-hold bypass detected, but left closed — DoD verified met.** ' +
+              bypassReason + ' ' + reason + ' See platform#4252: a direct close that genuinely satisfies the ' +
+              'tracking parent\'s DoD is self-healed (hold removed, issue stays closed) rather than reopened, ' +
+              'since reopening verified-done work would just force the same remediation again.';
+            execFileSync('gh', ['issue', 'comment', ISSUE_NUMBER, '--repo', REPO, '--body', selfHealComment], { stdio: 'inherit' });
+            console.log(`Self-healed ${REPO}#${ISSUE_NUMBER}: removed tracking-parent-hold, left closed.`);
+            process.exit(0);
+          }
+
+          execFileSync('gh', ['issue', 'reopen', ISSUE_NUMBER, '--repo', REPO], { stdio: 'inherit' });
+          execFileSync('gh', ['issue', 'edit', ISSUE_NUMBER, '--repo', REPO, '--add-label', 'tracking-parent-hold'], { stdio: 'inherit' });
+
+          const commentBody = '🔒 **tracking-parent-hold bypass detected and reverted.** ' + bypassReason + ' ' + reason + ' ' +
+            'Reopening and restoring `tracking-parent-hold` automatically — see platform#3253 (this exact ' +
+            'pattern recurred three times before a prompt-only guardrail proved insufficient). This is not a ' +
+            'judgment call on whether the tracking parent\'s definition of done is actually met: if it is, ' +
+            'remove `tracking-parent-hold` and let `tracking-parent-auto-closer.yml` verify and close it; if ' +
+            'closing now is still correct despite that, do not just close it directly again — this guard will ' +
+            'revert the same bypass pattern every time.';
+
+          execFileSync('gh', ['issue', 'comment', ISSUE_NUMBER, '--repo', REPO, '--body', commentBody], { stdio: 'inherit' });
+          console.log(`Reverted bypass close on ${REPO}#${ISSUE_NUMBER}.`);
+          NODE_EOF
+          node /tmp/tracking-parent-hold-guard.js
