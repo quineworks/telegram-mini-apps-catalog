@@ -1,0 +1,250 @@
+# platform#1943 (part of the #1938 status-page effort; parallel in
+# structure to changelog.yml, sibling to #1942 which shipped the static
+# `/status` page + hand-seeded `site/public/status.json` this workflow now
+# keeps live going forward).
+#
+# Pure label-event -> status.json derivation logic lives in
+# scripts/status-derive.cjs (tested by scripts/test-status.cjs /
+# status-test.yml — same split as tracking-parent-auto-closer.cjs/.yml);
+# this workflow is the cross-repo fetch + lock + PR-land glue.
+#
+# Runs from all three repos (`platform`, `pouchbooks`, `tax-lane` — a
+# workflow trigger only fires from a copy of the file physically present in
+# the repo the event happens in) since a live incident can be opened in any
+# of them. Two things follow from that:
+#
+# 1. Computing component state correctly (multi-incident overlap: two open
+#    incidents mapping to the same component) needs a live cross-repo read
+#    of every open `live-incident`-labeled issue, not just the one issue
+#    that fired this event — so every run re-queries all three repos rather
+#    than only patching the triggering issue's own row.
+# 2. When this runs *from* pouchbooks/tax-lane, it still has to write
+#    site/public/status.json in *platform*. The default per-run
+#    `github.token` is scoped only to the repo the workflow runs in and
+#    can't do that, so — same pattern sync-governance-workflows.yml/
+#    pouchbooks-feature-drift-check.yml already use for their own
+#    cross-repo writes — this fetches the org-wide `quineworks/github-token`
+#    PAT from Secrets Manager. Unlike those two (platform-only workflows,
+#    scoped to `github_actions_platform`), this one has to assume the
+#    broader `github_actions` role (trusted for repo:quineworks/*:*, see
+#    infra/github.tf's `github_actions_read_github_token` grant) since it
+#    runs from every repo, not just platform.
+#
+# `status.json` lives behind platform's protected main
+# (`main-review-gate` ruleset, `bypass_actors: []`) — a bare Contents-API
+# write straight to main 409s there (scripts/bootstrap-product-repo.sh's
+# own header comment documents hitting the same wall). So this lands
+# changes the way sync-governance-workflows.yml lands governance-file
+# drift: push to a dedicated branch (`status-sync`) and open/reuse a PR on
+# it — request-review.yml already auto-dispatches a reviewer on
+# `pull_request: opened/synchronize`, so this rides the existing
+# review-gate with no new plumbing.
+#
+# Since `status-sync` gets touched far more often than `governance-sync`
+# (every qualifying label event across three repos, not just a platform
+# push touching scripts/workflows), two runs racing each other is a real
+# scenario, not a hypothetical: this reuses changelog.yml's DynamoDB
+# conditional-put lock acquire/release primitive (new key, `status-lock`,
+# infra/status.tf) around the whole read-derive-write, and — the part a
+# lock alone doesn't cover — always reads `status.json` off the *current
+# tip of the status-sync branch* if a PR is already open on it, never off
+# stale main, so back-to-back label events build on each other instead of
+# each independently computing from the same stale base and clobbering the
+# other's diff when they land.
+# platform#2195/PR#2196 hardened issue-close-enforcer.yml's un-retried `gh`
+# calls against transient GitHub API 5xx (same failure class as the
+# review-verdict status POST hardened in #2191/PR#2192); this workflow had
+# the identical gap (`gh label create` here 503'd bare, run 32050090722,
+# 2026-08-17) so it gets the same bounded retry-with-backoff treatment,
+# both in the shell step below and in the Node script's shared `gh()`
+# helper (transient-5xx-only there, so it doesn't slow down the several
+# calls that already use try/catch to mean "expected 404, not found yet").
+#
+# platform#3685: a `live-incident` label removed one second before its
+# issue closed (two separate webhook events) once left an incident
+# permanently stuck unresolved in `status.json` -- the `closed` event's own
+# gate step below correctly sees the label already gone and skips (nothing
+# wrong with that by itself), and whatever the `unlabeled` event's run did
+# apparently lost a race against this same lock/branch and never durably
+# landed the resolution either. Rather than chase that exact interleaving
+# further, the recompute step (now `scripts/status-sync-run.cjs`, pulled
+# out of this file so `status-resync.yml`'s scheduled safety-net run can
+# share it) independently re-checks the live state of every currently-
+# unresolved incident's own issue on *every* run, event-driven or
+# scheduled -- so a stuck entry resolves the next time anything touches
+# this workflow, regardless of which event (if any) is responsible for
+# noticing. `status-resync.yml` additionally guarantees "the next time" is
+# never more than a day away even if no qualifying event fires at all.
+name: status
+
+on:
+  issues:
+    types: [labeled, unlabeled, closed, reopened]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: status-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ondemand-x86_64
+    steps:
+      # Self-healing, same pattern as label-enforcer.yml's needs-label /
+      # request-review.yml's needs-review: idempotent (--force), cheap, run
+      # every invocation so all three repos end up carrying the four labels
+      # without a separate one-time provisioning script.
+      #
+      # platform#2550: component:pouchbooks-app/component:pouchbooks-sync
+      # dropped from the set this step ensures, matching their removal from
+      # scripts/status-derive.cjs's COMPONENTS -- a label status-derive.cjs
+      # no longer maps to any component is inert (it just never affects any
+      # component's state), so this is cleanup, not a required fix. Existing
+      # copies of the two labels on already-labeled historical issues are
+      # left alone -- this only stops re-asserting/re-creating them.
+      - name: Ensure the live-incident/component/severity labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          if ! retry gh label create live-incident --repo "$REPO" --color b60205 \
+            --description "Active, user-facing degradation or outage — status.yml (platform#1943) picks this up automatically" --force; then
+            echo "::error::gh label create live-incident failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh label create component:quineworks-site --repo "$REPO" --color 5319e7 \
+            --description "Incident affects quineworks.com — status.yml component mapping" --force; then
+            echo "::error::gh label create component:quineworks-site failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh label create component:taxlane --repo "$REPO" --color 5319e7 \
+            --description "Incident affects TaxLane — status.yml component mapping" --force; then
+            echo "::error::gh label create component:taxlane failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh label create severity:down --repo "$REPO" --color d93f0b \
+            --description "Full outage, not just degraded — status.yml renders the mapped component(s) as down" --force; then
+            echo "::error::gh label create severity:down failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+
+      # Cheap early-exit before touching AWS/cross-repo APIs: most issue
+      # events on any of the three repos have nothing to do with a live
+      # incident. A labeled/unlabeled event is relevant if the label itself
+      # is live-incident (add or remove), or if a component:*/severity:down
+      # label changed on an issue that currently carries live-incident. A
+      # closed/reopened event is relevant if the issue currently carries
+      # live-incident (labels persist through close/reopen).
+      - name: Decide whether this event needs a status.json recompute
+        id: gate
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          ISSUE_LABELS_JSON: ${{ toJSON(github.event.issue.labels) }}
+        run: |
+          HAS_LIVE_INCIDENT=$(jq -r '[.[] | select(.name == "live-incident")] | length > 0' <<<"$ISSUE_LABELS_JSON")
+
+          if [[ "$EVENT_ACTION" == "labeled" || "$EVENT_ACTION" == "unlabeled" ]]; then
+            if [[ "$LABEL_NAME" == "live-incident" ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            elif [[ "$LABEL_NAME" == component:* || "$LABEL_NAME" == "severity:down" ]] && [[ "$HAS_LIVE_INCIDENT" == "true" ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # closed / reopened
+            if [[ "$HAS_LIVE_INCIDENT" == "true" ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        if: steps.gate.outputs.run == 'true'
+        # Reads the `github_token` field from the field-scoped secrets
+        # broker (platform#2276, part of the #2261 consolidation) instead of
+        # a direct `aws secretsmanager get-secret-value` against the old
+        # per-secret `quineworks/github-token` -- authorized by
+        # `aws_iam_role_policy.github_actions_invoke_secrets_broker`
+        # (infra/secrets_broker.tf). This file is auto-propagated verbatim
+        # into tax-lane/pouchbooks by sync-governance-workflows.yml, so this
+        # one edit covers all three repos' status.yml -- see #2276.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
+      # Guards the branch read-derive-write below against two of these runs
+      # (from any of the three repos) racing each other — same pattern
+      # changelog.yml uses, new lock key so the two can't contend.
+      - name: Acquire status lock
+        id: lock
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set +e
+          for i in $(seq 1 10); do
+            NOW=$(date -u +%s)
+            TTL=$((NOW + 60))
+            OUT=$(aws dynamodb put-item \
+              --table-name quineworks-state \
+              --item "{\"pk\": {\"S\": \"status-lock\"}, \"ttl\": {\"N\": \"${TTL}\"}}" \
+              --condition-expression "attribute_not_exists(pk) OR #ttl < :now" \
+              --expression-attribute-names '{"#ttl": "ttl"}' \
+              --expression-attribute-values "{\":now\": {\"N\": \"${NOW}\"}}" 2>&1)
+            if [[ $? -eq 0 ]]; then
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$OUT" != *ConditionalCheckFailedException* ]]; then
+              echo "$OUT" >&2
+              exit 1
+            fi
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "Could not acquire status lock after 10 tries" >&2
+          exit 1
+
+      - name: Recompute and land status.json
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TRIGGER_ISSUE_JSON: ${{ toJSON(github.event.issue) }}
+        # Shared glue, platform#3685: scripts/status-sync-run.cjs holds the
+        # cross-repo fetch + derive + branch/PR-land logic, reused verbatim
+        # by status-resync.yml's scheduled safety-net run (same file,
+        # TRIGGER_ISSUE_JSON unset there instead of this event's issue).
+        run: node scripts/status-sync-run.cjs
+
+      - name: Release status lock
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          aws dynamodb delete-item \
+            --table-name quineworks-state \
+            --key '{"pk": {"S": "status-lock"}}'
